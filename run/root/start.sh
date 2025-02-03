@@ -39,6 +39,12 @@ else
 
 		# note - do not remove redirection of gateway for ipv6 - required for certain vpn providers (airvpn)
 
+		# remove keysize from ovpn file if present, deprecated and now removed option
+		sed -i '/^keysize.*/d' "${VPN_CONFIG}"
+
+		# remove ncp-disable from ovpn file if present, deprecated and now removed option
+		sed -i '/^ncp-disable/d' "${VPN_CONFIG}"
+
 		# remove persist-tun from ovpn file if present, this allows reconnection to tunnel on disconnect
 		sed -i '/^persist-tun/d' "${VPN_CONFIG}"
 
@@ -103,99 +109,22 @@ else
 
 	fi
 
-	# split comma separated string into list from NAME_SERVERS env variable
-	IFS=',' read -ra name_server_list <<< "${NAME_SERVERS}"
+	# workaround for pia CRL issue
+	if [[ "${VPN_CLIENT}" == "openvpn" ]]; then
 
-	# remove existing ns, docker injects ns from host and isp ns can block/hijack
-	> /etc/resolv.conf
+		if [[ "${VPN_PROV}" == "pia" ]]; then
 
-	# process name servers in the list
-	for name_server_item in "${name_server_list[@]}"; do
+			# turn off compression, required to bypass pia crl-verify issue with pia
+			# see https://github.com/binhex/arch-qbittorrentvpn/issues/233
+			sed -i -e 's~^compress~comp-lzo no~g' "${VPN_CONFIG}"
 
-		# strip whitespace from start and end of name_server_item
-		name_server_item=$(echo "${name_server_item}" | sed -e 's~^[ \t]*~~;s~[ \t]*$~~')
-
-		echo "[info] Adding ${name_server_item} to /etc/resolv.conf"
-		echo "nameserver ${name_server_item}" >> /etc/resolv.conf
-
-	done
-
-	# split comma separated string into list from VPN_REMOTE_SERVER variable
-	IFS=',' read -ra vpn_remote_server_list <<< "${VPN_REMOTE_SERVER}"
-
-	# initialise array used to store remote ip addresses for all remote endpoints
-	vpn_remote_ip_array=()
-
-	# process remote servers in the array
-	for vpn_remote_item in "${vpn_remote_server_list[@]}"; do
-
-		vpn_remote_server=$(echo "${vpn_remote_item}" | tr -d ',')
-
-		# if the vpn_remote_server is NOT an ip address then resolve it
-		if ! echo "${vpn_remote_server}" | grep -P -o '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}'; then
-
-			retry_count=12
-
-			while true; do
-
-				retry_count=$((retry_count-1))
-
-				if [ "${retry_count}" -eq "0" ]; then
-
-					echo "[crit] '${vpn_remote_server}' cannot be resolved, possible DNS issues, exiting..." ; exit 1
-
-				fi
-
-				# resolve hostname to ip address(es)
-				# note grep -m 8 is used to limit number of returned ip's per host to
-				# 8 to reduce the change of hitting 64 remote options for openvpn
-				vpn_remote_item_dns_answer=$(drill -a -4 "${vpn_remote_server}" | grep -v 'SERVER' | grep -m 8 -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | xargs)
-
-				# check answer is not blank, if it is blank assume bad ns
-				if [[ ! -z "${vpn_remote_item_dns_answer}" ]]; then
-
-					if [[ "${DEBUG}" == "true" ]]; then
-						echo "[debug] DNS operational, we can resolve name '${vpn_remote_server}' to address '${vpn_remote_item_dns_answer}'"
-					fi
-
-					# append remote server ip addresses to the string using comma separators
-					vpn_remote_ip_array+=(${vpn_remote_item_dns_answer})
-
-					break
-
-				else
-
-					if [[ "${DEBUG}" == "true" ]]; then
-						echo "[debug] Having issues resolving name '${vpn_remote_server}', sleeping before retry..."
-					fi
-					sleep 5s
-
-				fi
-
-			done
-
-			# get first ip from ${vpn_remote_item_dns_answer} and write to the hosts file
-			# this is required as openvpn will use the remote entry in the ovpn file
-			# even if you specify the --remote options on the command line, and thus we
-			# must also be able to resolve the host name (assuming it is a name and not ip).
-			remote_dns_answer_first=$(echo "${vpn_remote_item_dns_answer}" | cut -d ' ' -f 1)
-
-			# if not blank then write to hosts file
-			if [[ ! -z "${remote_dns_answer_first}" ]]; then
-				echo "${remote_dns_answer_first}	${vpn_remote_server}" >> /etc/hosts
-			fi
-
-		else
-
-			# append remote server ip addresses to the string using comma separators
-			vpn_remote_ip_array+=(${vpn_remote_server})
+			# remove crl-verify as pia verification has invalid date
+			# see https://github.com/binhex/arch-qbittorrentvpn/issues/233
+			sed -i '/<crl-verify>/,/<\/crl-verify>/d' "${VPN_CONFIG}"
 
 		fi
 
-	done
-
-	# export all resolved vpn remote ip's - used in sourced openvpn.sh
-	export vpn_remote_ip_array="${vpn_remote_ip_array}"
+	fi
 
 	if [[ "${VPN_CLIENT}" == "openvpn" ]]; then
 

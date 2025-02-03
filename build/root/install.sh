@@ -3,6 +3,25 @@
 # exit script if return code != 0
 set -e
 
+# release tag name from buildx arg, stripped of build ver using string manipulation
+RELEASETAG="${1}"
+
+# target arch from buildx arg
+TARGETARCH="${2}"
+
+if [[ -z "${RELEASETAG}" ]]; then
+	echo "[warn] Release tag name from build arg is empty, exiting script..."
+	exit 1
+fi
+
+if [[ -z "${TARGETARCH}" ]]; then
+	echo "[warn] Target architecture name from build arg is empty, exiting script..."
+	exit 1
+fi
+
+# write RELEASETAG to file to record the release tag used to build the image
+echo "INT_RELEASE_TAG=${RELEASETAG}" >> '/etc/image-release'
+
 # build scripts
 ####
 
@@ -15,30 +34,30 @@ unzip /tmp/scripts-master.zip -d /tmp
 # move shell scripts to /root
 mv /tmp/scripts-master/shell/arch/docker/*.sh /usr/local/bin/
 
-# detect image arch
-####
-
-OS_ARCH=$(cat /etc/os-release | grep -P -o -m 1 "(?=^ID\=).*" | grep -P -o -m 1 "[a-z]+$")
-if [[ ! -z "${OS_ARCH}" ]]; then
-	if [[ "${OS_ARCH}" == "arch" ]]; then
-		OS_ARCH="x86-64"
-	else
-		OS_ARCH="aarch64"
-	fi
-	echo "[info] OS_ARCH defined as '${OS_ARCH}'"
-else
-	echo "[warn] Unable to identify OS_ARCH, defaulting to 'x86-64'"
-	OS_ARCH="x86-64"
-fi
-
 # pacman packages
 ####
 
 # define pacman packages
-pacman_packages="openssl-1.1 kmod openvpn privoxy bind-tools gnu-netcat ipcalc wireguard-tools openresolv"
+pacman_packages="base-devel cargo openssl-1.1 kmod openvpn privoxy bind-tools ipcalc wireguard-tools openresolv libnatpmp ldns"
 
 # install pre-reqs
 pacman -S --needed $pacman_packages --noconfirm
+
+# github release - microsocks
+####
+
+# download and compile microsocks
+github.sh --install-path '/tmp/compile' --github-owner 'rofl0r' --github-repo 'microsocks' --query-type 'release' --compile-src 'make install'
+
+# cargo (rust) install - boringtun-cli
+####
+
+# install boringtun-cli using rust tool 'cargo'
+cargo install boringtun-cli
+
+# move and chmod compiled binary to /usr/local/bin
+mv /home/nobody/.cargo/bin/boringtun-cli /usr/local/bin/
+chmod +x /usr/local/bin/boringtun-cli
 
 # env vars
 ####
@@ -70,6 +89,10 @@ fi
 
 if [[ "${VPN_ENABLED}" == "yes" ]]; then
 
+	# listen for incoming connections on port 1234 from other containers, this is used to trigger
+	# the restart of the containers sharing the network if the vpn container is restarted.
+	nohup nc -l -s 127.0.0.1 -p 1234 -k &>> '/tmp/nc_listen.log' &
+
 	# get values from env vars as defined by user
 	export VPN_CLIENT=$(echo "${VPN_CLIENT}" | sed -e 's~^[ \t]*~~;s~[ \t]*$~~')
 	if [[ ! -z "${VPN_CLIENT}" ]]; then
@@ -85,26 +108,6 @@ if [[ "${VPN_ENABLED}" == "yes" ]]; then
 		echo "[info] VPN_PROV defined as '${VPN_PROV}'" | ts '%Y-%m-%d %H:%M:%.S'
 	else
 		echo "[crit] VPN_PROV not defined,(via -e VPN_PROV), exiting..." | ts '%Y-%m-%d %H:%M:%.S' && exit 1
-	fi
-
-	if [[ "${VPN_PROV}" == "pia" ]]; then
-
-		pia_vpninfo_api_url="https://serverlist.piaservers.net/vpninfo/servers/v4"
-
-		# export vpninfo json as this is used in getvpnport.sh and wireguard.sh
-		export PIA_VPNINFO_API=$(curl --silent "${pia_vpninfo_api_url}")
-
-		if [[ -z "${PIA_VPNINFO_API}" ]]; then
-
-			if [[ "${VPN_CLIENT}" == "wireguard" ]]; then
-				echo "[crit] PIA VPN server info JSON cannot be downloaded from URL '${pia_vpninfo_api_url}' exit code from curl is '${?}', exiting..." | ts '%Y-%m-%d %H:%M:%.S'
-				exit 1
-			else
-				echo "[warn] PIA VPN server info JSON cannot be downloaded from URL '${pia_vpninfo_api_url}' exit code from curl is '${?}'" | ts '%Y-%m-%d %H:%M:%.S'
-			fi
-
-		fi
-
 	fi
 
 	if [[ "${VPN_CLIENT}" == "wireguard" ]]; then
@@ -143,16 +146,8 @@ if [[ "${VPN_ENABLED}" == "yes" ]]; then
 				echo "[info] VPN_REMOTE_SERVER not defined (wireguard config doesnt file exists), defaulting to 'nl-amsterdam.privacy.network'" | ts '%Y-%m-%d %H:%M:%.S'
 				export VPN_REMOTE_SERVER="nl-amsterdam.privacy.network"
 
-				# get wireguard port from pia api, as the port could change
-				jq_query_wg_ports=".groups | .wg | .[] | .ports[]"
-				export VPN_REMOTE_PORT=$(echo "${PIA_VPNINFO_API}" | jq -r "${jq_query_wg_ports}" 2> /dev/null)
-
-				if [[ -z "${VPN_REMOTE_PORT}" ]]; then
-					echo "[info] VPN_REMOTE_PORT not defined (wireguard config file doesnt exists), defaulting to '1337'" | ts '%Y-%m-%d %H:%M:%.S'
-					export VPN_REMOTE_PORT="1337"
-				else
-					echo "[info] VPN_REMOTE_PORT not defined (wireguard config file doesnt exists), identified port as '${VPN_REMOTE_PORT}'" | ts '%Y-%m-%d %H:%M:%.S'
-				fi
+				echo "[info] VPN_REMOTE_PORT not defined (wireguard config file doesnt exists), defaulting to '1337'" | ts '%Y-%m-%d %H:%M:%.S'
+				export VPN_REMOTE_PORT="1337"
 
 			else
 
@@ -174,7 +169,7 @@ if [[ "${VPN_ENABLED}" == "yes" ]]; then
 			/usr/local/bin/dos2unix.sh "${VPN_CONFIG}"
 
 			# get endpoint line from wireguard config file
-			export VPN_REMOTE_SERVER=$(cat "${VPN_CONFIG}" | grep -P -o '(?<=^Endpoint\s=\s)[^:]+' || true)
+			export VPN_REMOTE_SERVER=$(cat "${VPN_CONFIG}" | grep -P -o '(?<=^Endpoint(\s)?=(\s)?)[^:]+' || true)
 			if [[ -z "${VPN_REMOTE_SERVER}" ]]; then
 				echo "[crit] VPN configuration file ${VPN_CONFIG} does not contain 'Endpoint' line, showing contents of file before exit..." | ts '%Y-%m-%d %H:%M:%.S'
 				cat "${VPN_CONFIG}" && exit 1
@@ -184,21 +179,15 @@ if [[ "${VPN_ENABLED}" == "yes" ]]; then
 
 			if [[ "${VPN_PROV}" == "pia" ]]; then
 
-				# get wireguard port from pia api, as the port could change
-				jq_query_wg_ports=".groups | .wg | .[] | .ports[]"
-				export VPN_REMOTE_PORT=$(echo "${PIA_VPNINFO_API}" | jq -r "${jq_query_wg_ports}" 2> /dev/null)
-
+				export VPN_REMOTE_PORT=$(cat "${VPN_CONFIG}" | grep -P -o '(?<=^Endpoint(\s)?=(\s)?).*' | grep -P -o '[\d]+$' || true)
 				if [[ -z "${VPN_REMOTE_PORT}" ]]; then
-					export VPN_REMOTE_PORT=$(cat "${VPN_CONFIG}" | grep -P -o '(?<=^Endpoint\s=\s).*' | grep -P -o '[\d]+$' || true)
-					if [[ -z "${VPN_REMOTE_PORT}" ]]; then
-						echo "[warn] VPN configuration file ${VPN_CONFIG} does not contain port on 'Endpoint' line, defaulting to '1337'" | ts '%Y-%m-%d %H:%M:%.S'
-						export VPN_REMOTE_PORT="1337"
-					fi
+					echo "[warn] VPN configuration file ${VPN_CONFIG} does not contain port on 'Endpoint' line, defaulting to '1337'" | ts '%Y-%m-%d %H:%M:%.S'
+					export VPN_REMOTE_PORT="1337"
 				fi
 
 			else
 
-				export VPN_REMOTE_PORT=$(cat "${VPN_CONFIG}" | grep -P -o '(?<=^Endpoint\s=\s).*' | grep -P -o '[\d]+$' || true)
+				export VPN_REMOTE_PORT=$(cat "${VPN_CONFIG}" | grep -P -o '(?<=^Endpoint(\s)?=(\s)?).*' | grep -P -o '[\d]+$' || true)
 				if [[ -z "${VPN_REMOTE_PORT}" ]]; then
 					echo "[crit] VPN configuration file ${VPN_CONFIG} does not contain port on 'Endpoint' line, showing contents of file before exit..." | ts '%Y-%m-%d %H:%M:%.S'
 					cat "${VPN_CONFIG}" && exit 1
@@ -217,6 +206,14 @@ if [[ "${VPN_ENABLED}" == "yes" ]]; then
 		# protocol for wireguard is always udp
 		echo "[info] VPN_REMOTE_PROTOCOL defined as 'udp'" | ts '%Y-%m-%d %H:%M:%.S'
 		export VPN_REMOTE_PROTOCOL="udp"
+
+		export USERSPACE_WIREGUARD=$(echo "${USERSPACE_WIREGUARD}" | sed -e 's~^[ \t]*~~;s~[ \t]*$~~')
+		if [[ ! -z "${USERSPACE_WIREGUARD}" ]]; then
+			echo "[info] USERSPACE_WIREGUARD defined as '${USERSPACE_WIREGUARD}'" | ts '%Y-%m-%d %H:%M:%.S'
+		else
+			echo "[info] USERSPACE_WIREGUARD not defined (via -e USERSPACE_WIREGUARD), defaulting to 'no'" | ts '%Y-%m-%d %H:%M:%.S'
+			export USERSPACE_WIREGUARD="no"
+		fi
 
 	elif [[ "${VPN_CLIENT}" == "openvpn" ]]; then
 
@@ -284,8 +281,7 @@ if [[ "${VPN_ENABLED}" == "yes" ]]; then
 				if [[ -z "${vpn_remote_port_cut}" ]]; then
 					vpn_remote_port_cut=$(echo "${vpn_remote_line_item}" | cut -d " " -f2 | grep -P -o '^[\d]{2,5}$' || true)
 					if [[ -z "${vpn_remote_port_cut}" ]]; then
-						echo "[warn] VPN confi
-						guration file ${VPN_CONFIG} remote port is missing or malformed, assuming port '1194'" | ts '%Y-%m-%d %H:%M:%.S'
+						echo "[warn] VPN configuration file ${VPN_CONFIG} remote port is missing or malformed, assuming port '1194'" | ts '%Y-%m-%d %H:%M:%.S'
 						vpn_remote_port_cut="1194"
 					fi
 				fi
@@ -343,19 +339,61 @@ if [[ "${VPN_ENABLED}" == "yes" ]]; then
 
 	fi
 
-	export LAN_NETWORK=$(echo "${LAN_NETWORK}" | sed -e 's~^[ \t]*~~;s~[ \t]*$~~')
-	if [[ ! -z "${LAN_NETWORK}" ]]; then
-		echo "[info] LAN_NETWORK defined as '${LAN_NETWORK}'" | ts '%Y-%m-%d %H:%M:%.S'
-	else
-		echo "[crit] LAN_NETWORK not defined (via -e LAN_NETWORK), exiting..." | ts '%Y-%m-%d %H:%M:%.S' && exit 1
-	fi
-
 	export NAME_SERVERS=$(echo "${NAME_SERVERS}" | sed -e 's~^[ \t]*~~;s~[ \t]*$~~')
 	if [[ ! -z "${NAME_SERVERS}" ]]; then
 		echo "[info] NAME_SERVERS defined as '${NAME_SERVERS}'" | ts '%Y-%m-%d %H:%M:%.S'
 	else
 		echo "[warn] NAME_SERVERS not defined (via -e NAME_SERVERS), defaulting to name servers defined in readme.md" | ts '%Y-%m-%d %H:%M:%.S'
-		export NAME_SERVERS="84.200.69.80,37.235.1.174,1.1.1.1,37.235.1.177,84.200.70.40,1.0.0.1"
+		export NAME_SERVERS="1.1.1.1,1.0.0.1"
+	fi
+
+	# resolve vpn endpoints, drop all, allow vpn endpoints, if client pia then also allow pia api and pia website
+	source /root/iptable-init.sh
+
+	export LAN_NETWORK=$(echo "${LAN_NETWORK}" | sed -e 's~^[ \t]*~~;s~[ \t]*$~~')
+	if [[ ! -z "${LAN_NETWORK}" ]]; then
+		echo "[info] LAN_NETWORK defined as '${LAN_NETWORK}'" | ts '%Y-%m-%d %H:%M:%.S'
+		faq_vpn_url="https://github.com/binhex/documentation/blob/master/docker/faq/vpn.md"
+
+		# split comma separated string into list from LAN_NETWORK env variable
+		IFS=',' read -ra lan_network_list <<< "${LAN_NETWORK}"
+		for i in "${lan_network_list[@]}"; do
+			if echo "${i}" | grep -q -P -m 1 '\/8$'; then
+				if echo "${i}" | grep -q -v -P -m 1 '\.0\.0\.0\/8$'; then
+					echo "[warn] Network '${i}' incorrectly defined, see Q4. ${faq_vpn_url}" | ts '%Y-%m-%d %H:%M:%.S'
+					first_octet=$(echo "${i}" | grep -P -o -m 1 '^\d{1,3}')
+					i="${first_octet}.0.0.0/8"
+					echo "[info] Network corrected to '${i}'" | ts '%Y-%m-%d %H:%M:%.S'
+				fi
+			elif echo "${i}" | grep -q -P -m 1 '\/16$'; then
+				if echo "${i}" | grep -q -v -P -m 1 '\.0\.0\/16$'; then
+					echo "[warn] Network '${i}' incorrectly defined, see Q4. ${faq_vpn_url}" | ts '%Y-%m-%d %H:%M:%.S'
+					first_second_octet=$(echo "${i}" | grep -P -o -m 1 '^\d{1,3}\.\d{1,3}')
+					i="${first_second_octet}.0.0/16"
+					echo "[info] Network corrected to '${i}'" | ts '%Y-%m-%d %H:%M:%.S'
+				fi
+			elif echo "${i}" | grep -q -P -m 1 '\/24$'; then
+				if echo "${i}" | grep -q -v -P -m 1 '\.0\/24$'; then
+					echo "[warn] Network '${i}' incorrectly defined, see Q4. ${faq_vpn_url}" | ts '%Y-%m-%d %H:%M:%.S'
+					first_second_third_octet=$(echo "${i}" | grep -P -o -m 1 '^\d{1,3}\.\d{1,3}\.\d{1,3}')
+					i="${first_second_third_octet}.0/24"
+					echo "[info] Network corrected to '${i}'" | ts '%Y-%m-%d %H:%M:%.S'
+				fi
+			fi
+
+			# strip out spaces
+			i=$(echo "${i}" | sed -e 's~^[ \t]*~~;s~[ \t]*$~~')
+
+			# append to variable with comma
+			NETWORK+="${i},"
+		done
+
+		# strip out trailing comma
+		export LAN_NETWORK=${NETWORK%?}
+
+		echo "[info] LAN_NETWORK exported as '${LAN_NETWORK}'" | ts '%Y-%m-%d %H:%M:%.S'
+	else
+		echo "[crit] LAN_NETWORK not defined (via -e LAN_NETWORK), exiting..." | ts '%Y-%m-%d %H:%M:%.S' && exit 1
 	fi
 
 	if [[ "${VPN_PROV}" != "airvpn" ]]; then
@@ -386,14 +424,6 @@ if [[ "${VPN_ENABLED}" == "yes" ]]; then
 
 	fi
 
-	export ENABLE_PRIVOXY=$(echo "${ENABLE_PRIVOXY}" | sed -e 's~^[ \t]*~~;s~[ \t]*$~~')
-	if [[ ! -z "${ENABLE_PRIVOXY}" ]]; then
-		echo "[info] ENABLE_PRIVOXY defined as '${ENABLE_PRIVOXY}'" | ts '%Y-%m-%d %H:%M:%.S'
-	else
-		echo "[warn] ENABLE_PRIVOXY not defined (via -e ENABLE_PRIVOXY), defaulting to 'no'" | ts '%Y-%m-%d %H:%M:%.S'
-		export ENABLE_PRIVOXY="no"
-	fi
-
 	export ADDITIONAL_PORTS=$(echo "${ADDITIONAL_PORTS}" | sed -e 's~^[ \t]*~~;s~[ \t]*$~~')
 	export VPN_INPUT_PORTS=$(echo "${VPN_INPUT_PORTS}" | sed -e 's~^[ \t]*~~;s~[ \t]*$~~')
 	if [[ ! -z "${ADDITIONAL_PORTS}" ]]; then
@@ -413,6 +443,53 @@ if [[ "${VPN_ENABLED}" == "yes" ]]; then
 		echo "[info] VPN_OUTPUT_PORTS not defined (via -e VPN_OUTPUT_PORTS), skipping allow for custom outgoing ports" | ts '%Y-%m-%d %H:%M:%.S'
 	fi
 
+	export ENABLE_STARTUP_SCRIPTS=$(echo "${ENABLE_STARTUP_SCRIPTS}" | sed -e 's~^[ \t]*~~;s~[ \t]*$~~')
+	if [[ ! -z "${ENABLE_STARTUP_SCRIPTS}" ]]; then
+		echo "[info] ENABLE_STARTUP_SCRIPTS defined as '${ENABLE_STARTUP_SCRIPTS}'" | ts '%Y-%m-%d %H:%M:%.S'
+	else
+		echo "[info] ENABLE_STARTUP_SCRIPTS not defined (via -e ENABLE_STARTUP_SCRIPTS), defaulting to 'no'" | ts '%Y-%m-%d %H:%M:%.S'
+		export ENABLE_STARTUP_SCRIPTS="no"
+	fi
+
+fi
+
+export ENABLE_SOCKS=$(echo "${ENABLE_SOCKS}" | sed -e 's~^[ \t]*~~;s~[ \t]*$~~')
+if [[ ! -z "${ENABLE_SOCKS}" ]]; then
+	echo "[info] ENABLE_SOCKS defined as '${ENABLE_SOCKS}'" | ts '%Y-%m-%d %H:%M:%.S'
+else
+	echo "[warn] ENABLE_SOCKS not defined (via -e ENABLE_SOCKS), defaulting to 'no'" | ts '%Y-%m-%d %H:%M:%.S'
+	export ENABLE_SOCKS="no"
+fi
+
+export ENABLE_PRIVOXY=$(echo "${ENABLE_PRIVOXY}" | sed -e 's~^[ \t]*~~;s~[ \t]*$~~')
+if [[ ! -z "${ENABLE_PRIVOXY}" ]]; then
+	echo "[info] ENABLE_PRIVOXY defined as '${ENABLE_PRIVOXY}'" | ts '%Y-%m-%d %H:%M:%.S'
+else
+	echo "[warn] ENABLE_PRIVOXY not defined (via -e ENABLE_PRIVOXY), defaulting to 'no'" | ts '%Y-%m-%d %H:%M:%.S'
+	export ENABLE_PRIVOXY="no"
+fi
+
+if [[ "${ENABLE_SOCKS}" == "yes" ]]; then
+
+	export SOCKS_USER=$(echo "${SOCKS_USER}" | sed -e 's~^[ \t]*~~;s~[ \t]*$~~')
+	if [[ ! -z "${SOCKS_USER}" ]]; then
+		echo "[info] SOCKS_USER defined as '${SOCKS_USER}'" | ts '%Y-%m-%d %H:%M:%.S'
+	else
+		echo "[warn] SOCKS_USER not defined (via -e SOCKS_USER), disabling authentication for microsocks" | ts '%Y-%m-%d %H:%M:%.S'
+		export SOCKS_USER=""
+	fi
+
+	if [[ -n "${SOCKS_USER}" ]]; then
+
+		export SOCKS_PASS=$(echo "${SOCKS_PASS}" | sed -e 's~^[ \t]*~~;s~[ \t]*$~~')
+		if [[ ! -z "${SOCKS_PASS}" ]]; then
+			echo "[info] SOCKS_PASS defined as '${SOCKS_PASS}'" | ts '%Y-%m-%d %H:%M:%.S'
+		else
+			echo "[warn] SOCKS_PASS not defined (via -e SOCKS_PASS), defaulting to 'socks'" | ts '%Y-%m-%d %H:%M:%.S'
+			export SOCKS_PASS="socks"
+		fi
+
+	fi
 fi
 
 EOF
@@ -423,6 +500,40 @@ sed -i '/# ENVVARS_COMMON_PLACEHOLDER/{
     r /tmp/envvars_common_heredoc
 }' /usr/local/bin/init.sh
 rm /tmp/envvars_common_heredoc
+
+cat <<'EOF' > /tmp/config_heredoc
+
+if [[ "${ENABLE_STARTUP_SCRIPTS}" == "yes" ]]; then
+
+	# define path to scripts
+	base_path="/config"
+	user_script_path="${base_path}/scripts"
+
+	mkdir -p "${user_script_path}"
+
+	# find any scripts located in "${user_script_path}"
+	user_scripts=$(find "${user_script_path}" -maxdepth 1 -name '*sh' 2> '/dev/null' | xargs)
+
+	# loop over scripts, make executable and source
+	for i in ${user_scripts}; do
+		chmod +x "${i}"
+		echo "[info] Executing user script '${i}' in the foreground..." | ts '%Y-%m-%d %H:%M:%.S'
+		source "${i}" | ts '%Y-%m-%d %H:%M:%.S [script]'
+	done
+
+	# change ownership as we are running as root
+	chown -R nobody:users "${user_script_path}"
+
+fi
+
+EOF
+
+# replace config placeholder string with contents of file (here doc)
+sed -i '/# CONFIG_PLACEHOLDER/{
+    s/# CONFIG_PLACEHOLDER//g
+    r /tmp/config_heredoc
+}' /usr/local/bin/init.sh
+rm /tmp/config_heredoc
 
 # cleanup
 cleanup.sh

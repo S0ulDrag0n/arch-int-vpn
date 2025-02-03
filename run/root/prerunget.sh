@@ -2,15 +2,18 @@
 
 # script to call multiple scripts in series to read and then write out values
 
-# blocking script, will wait for valid ip address assigned to tun0/tap0 (port written to file /tmp/getvpnip)
-source /root/getvpnip.sh
+# source in various tools
+source tools.sh
 
-# blocking script, will wait for name resolution to be operational (will write to /tmp/dnsfailure if failure)
-source /home/nobody/checkdns.sh www.google.com
+# blocking function, will wait for valid ip address assigned to tun0/tap0 (port written to file /tmp/getvpnip)
+get_vpn_gateway_ip
 
-# blocking script, will wait for external ip address retrieval (external ip written to file /tmp/getvpnextip)
-source /root/getvpnextip.sh
+# blocking function, will wait for name resolution to be operational (will write to /tmp/dnsfailure if failure)
+check_dns www.google.com
 
-# backgrounded script, will wait for vpn incoming port to be assigned (port written to file /tmp/getvpnport)
-# note cannot 'source' as you cannot background a sourced file (background creates new shell)
-/root/getvpnport.sh &
+# blocking function, will wait for external ip address retrieval (external ip written to file /tmp/getvpnextip)
+get_vpn_external_ip
+
+# pia|protonvpn only - backgrounded function, will wait for vpn incoming port to be assigned (port written to file /tmp/getvpnport)
+# note backgrounded as running in infinite loop to check for port assignment
+get_vpn_incoming_port &
